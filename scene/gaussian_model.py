@@ -12,6 +12,7 @@
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.camera_utils import Camera
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -20,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, build_scaling_rotation_inverse
+import matplotlib.pyplot as plt
 
 
 def quaternion_multiply(q1, q2):
@@ -52,6 +54,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._label = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
 
@@ -75,19 +78,24 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
     
     def param_names(self):
-        return ['_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation', '_opacity', 'max_radii2D', 'xyz_gradient_accum']
+        return ['_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation', '_opacity', '_label', 'max_radii2D', 'xyz_gradient_accum']
 
     @classmethod
     def build_from(cls, gs, **kwargs):
         new_gs = GaussianModel(**kwargs)
         new_gs._xyz = nn.Parameter(gs._xyz)
         new_gs._features_dc = nn.Parameter(torch.zeros_like(gs._features_dc))
-        new_gs._features_rest = nn.Parameter(torch.zeros_like(gs._features_rest))
+        new_gs._features_rest = nn.Parameter(torch.zeros_like(gs._features_rest))       
         new_gs._scaling = nn.Parameter(gs._scaling)
         new_gs._rotation = nn.Parameter(gs._rotation)
         new_gs._opacity = nn.Parameter(gs._opacity)
         new_gs.feature = nn.Parameter(gs.feature)
         new_gs.max_radii2D = torch.zeros((new_gs.get_xyz.shape[0]), device="cuda")
+
+        if hasattr(gs, "_label") and gs._label is not None:
+            new_gs._label = gs._label.clone()
+        else:
+            new_gs._label = torch.full((new_gs.get_xyz.shape[0],), -1, dtype=torch.long, device="cuda")
         return new_gs
 
     @property
@@ -112,6 +120,10 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    @property
+    def get_label(self):
+        return self._label
 
     @property
     def get_features(self):
@@ -178,6 +190,16 @@ class GaussianModel:
         if self.with_motion_mask:
             self.feature.data[..., -1] = torch.zeros_like(self.feature[..., -1])
 
+        if hasattr(pcd, 'labels') and pcd.labels is not None:
+            if isinstance(pcd.labels, np.ndarray):
+                labels = torch.tensor(pcd.labels, dtype=torch.long, device="cuda")
+            else:
+                labels = pcd.labels.to("cuda")
+        else:
+            labels = torch.full((self._xyz.shape[0],), -1, dtype=torch.long, device="cuda")  # 默认 label 为 -1（未标注）
+
+        self._label = labels
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -224,6 +246,7 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         for i in range(self.fea_dim):
             l.append('fea_{}'.format(i))
+        l.append('label')
         return l
 
     def save_ply(self, path):
@@ -241,12 +264,68 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        
         if self.fea_dim > 0:
             feature = self.feature.detach().cpu().numpy()
             attributes = np.concatenate((attributes, feature), axis=1)
+        
+        if hasattr(self, '_label') and self._label is not None:
+            label = self._label.detach().cpu().numpy().reshape(-1, 1)
+            attributes = np.concatenate((attributes, label), axis=1)
+
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    # def save_ply(self, path, use_label_color=False):
+    #     mkdir_p(os.path.dirname(path))
+
+    #     xyz = self._xyz.detach().cpu().numpy()
+    #     normals = np.zeros_like(xyz)
+
+    #     if use_label_color and hasattr(self, '_label') and self._label is not None:
+    #         import pdb
+    #         pdb.set_trace()
+    #         # overwrite f_dc with label colors
+    #         label = self._label.detach().cpu()
+    #         f_dc = torch.zeros((label.shape[0], 3), dtype=torch.float32)
+
+    #         color_map = {
+    #             1: torch.tensor([1.0, 0.0, 0.0]),  # Red
+    #             2: torch.tensor([0.0, 1.0, 0.0]),  # Green
+    #             3: torch.tensor([0.0, 0.0, 1.0])   # Blue
+    #         }
+
+    #         for class_id, color in color_map.items():
+    #             f_dc[label == class_id] = color
+
+    #         f_dc = f_dc.numpy()
+    #         f_dc = f_dc.reshape(-1, 3)  # (N, 3)
+    #     else:
+    #         # use original feature color
+    #         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+
+    #     f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+    #     opacities = self._opacity.detach().cpu().numpy()
+    #     scale = self._scaling.detach().cpu().numpy()
+    #     rotation = self._rotation.detach().cpu().numpy()
+
+    #     dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+    #     elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+    #     attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+
+    #     if self.fea_dim > 0:
+    #         feature = self.feature.detach().cpu().numpy()
+    #         attributes = np.concatenate((attributes, feature), axis=1)
+
+    #     if hasattr(self, '_label') and self._label is not None:
+    #         label = self._label.detach().cpu().numpy().reshape(-1, 1)
+    #         attributes = np.concatenate((attributes, label), axis=1)
+
+    #     elements[:] = list(map(tuple, attributes))
+    #     el = PlyElement.describe(elements, 'vertex')
+    #     PlyData([el]).write(path)
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
@@ -289,6 +368,12 @@ class GaussianModel:
         feas = np.zeros((xyz.shape[0], self.fea_dim))
         for idx, attr_name in enumerate(fea_names):
             feas[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        if "label" in plydata.elements[0].data.dtype.names:
+            labels = np.asarray(plydata.elements[0]["label"]).astype(np.int64)
+            self._label = torch.tensor(labels, dtype=torch.long, device="cuda")
+        else:
+            self._label = torch.zeros(xyz.shape[0], dtype=torch.long, device="cuda")
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(
@@ -360,6 +445,9 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        if hasattr(self, "_label"):
+            self._label = self._label[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -383,11 +471,15 @@ class GaussianModel:
                 group["params"][0] = nn.Parameter(
                     torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
+        
+        if hasattr(self, "_label") and "label" in tensors_dict:
+            label_tensor = tensors_dict["label"].to(self._label.device).view(-1)
+            self._label = torch.cat([self._label, label_tensor], dim=0)
 
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_feature=None):
+                              new_rotation, new_feature=None, new_label=None):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -397,6 +489,9 @@ class GaussianModel:
         
         if self.fea_dim > 0:
             d["feature"] = new_feature
+
+        if hasattr(self, "_label") and new_label is not None:
+            d["label"] = new_label
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -408,6 +503,9 @@ class GaussianModel:
 
         if self.fea_dim > 0:
             self.feature = optimizable_tensors["feature"]
+
+        if hasattr(self, "_label") and "label" in optimizable_tensors:
+            self._label = optimizable_tensors["label"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -437,7 +535,9 @@ class GaussianModel:
 
         new_feature = self.feature[selected_pts_mask].repeat(N, 1) if self.fea_dim > 0 else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_feature)
+        new_label = self._label[selected_pts_mask].repeat(N, 1) if hasattr(self, "_label") else None
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_feature, new_label)
 
         if not without_prune:
             prune_filter = torch.cat(
@@ -461,7 +561,9 @@ class GaussianModel:
 
         new_feature = self.feature[selected_pts_mask] if self.fea_dim > 0  else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_feature)
+        new_label = self._label[selected_pts_mask] if hasattr(self, "_label") else None
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_feature, new_label)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -483,6 +585,368 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def project_xyz_to_image(self, xyz_world: torch.Tensor, camera: Camera):
+        """
+        Project 3D points to 2D image coordinates using simple matrix math.
+
+        Args:
+            xyz_world: (N, 3) tensor of points in world space.
+            camera: Camera object containing intrinsics and full_proj_transform.
+
+        Returns:
+            - uv: (N, 2) image pixel coordinates (u, v)
+            - depth: (N,) depth in camera clip space (used for filtering)
+        """
+        N = xyz_world.shape[0]
+        xyz_h = torch.cat([xyz_world, torch.ones((N, 1), device=xyz_world.device)], dim=1)  # (N, 4)
+
+        # Apply projection transformation
+        proj_pts = xyz_h @ camera.full_proj_transform  # (N, 4)
+        proj_pts = proj_pts[:, :2] / proj_pts[:, 3:]  # perspective divide
+        
+        # Convert NDC to pixel coordinates - try different scaling
+        # The issue might be that we need to center the coordinates properly
+        proj_pts = (proj_pts + 1) / 2 * torch.tensor([camera.image_width, camera.image_height], device=xyz_world.device)
+        
+        # Try to center the coordinates - subtract offset to bring them into proper range
+        proj_pts[:, 0] = proj_pts[:, 0] - (proj_pts[:, 0].mean() - camera.image_width / 2)
+        proj_pts[:, 1] = proj_pts[:, 1] - (proj_pts[:, 1].mean() - camera.image_height / 2)
+
+        # Calculate actual distances from camera to each Gaussian
+        camera_pos = torch.tensor([camera.camera_center[0], camera.camera_center[1], camera.camera_center[2]], device=xyz_world.device)
+        distances = torch.norm(xyz_world - camera_pos, dim=1)  # (N,) - actual distances
+
+        return proj_pts, distances
+
+    def render_clean_image(self, camera: Camera, save_path: str = None):
+        """
+        Render a clean image of 3D Gaussians without background for segmentation.
+        Also returns the Gaussian-to-pixel mapping for label assignment.
+        
+        Args:
+            camera: Camera object for rendering
+            save_path: Optional path to save the rendered image
+            
+        Returns:
+            rendered_image: Clean rendered image tensor (3, H, W)
+            gaussian_to_pixel: Dict containing 'proj_pts', 'depth', and 'image_size'
+        """
+        from gaussian_renderer import render
+        import torchvision
+        import os
+        
+        # Create a simple pipeline for rendering
+        class SimplePipe:
+            def __init__(self):
+                self.debug = False
+                self.compute_cov3D_python = False
+                self.convert_SHs_python = False
+        
+        pipe = SimplePipe()
+        # Use white background for clean segmentation
+        bg_color = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
+        
+        # Render with no deformation (original 3D positions)
+        with torch.no_grad():
+            results = render(camera, self, pipe, bg_color, 
+                           d_xyz=torch.zeros_like(self._xyz), 
+                           d_rotation=torch.zeros((self._xyz.shape[0], 4), device=self._xyz.device),
+                           d_scaling=torch.zeros_like(self._xyz))
+            
+            # Get the rendered image (RGB channels only)
+            rendered_image = results["render"]  # (3, H, W)
+            
+            # Get the actual projection data from the render pipeline
+            H, W = rendered_image.shape[1], rendered_image.shape[2]
+            
+            # The render pipeline should provide viewspace_points
+            # if "viewspace_points" in results and results["viewspace_points"] is not None:
+            #     viewspace_points = results["viewspace_points"]
+            #     # viewspace_points should be in NDC coordinates, convert to pixel coordinates
+            #     proj_pts = viewspace_points[:, :2]  # (N, 2) - [u, v] in NDC
+            #     depth = viewspace_points[:, 2]  # (N,) - depth
+                
+            #     # Convert from NDC to pixel coordinates
+            #     proj_pts[:, 0] = (proj_pts[:, 0] + 1) * 0.5 * W  # u: [-1,1] -> [0,W]
+            #     proj_pts[:, 1] = (proj_pts[:, 1] + 1) * 0.5 * H  # v: [-1,1] -> [0,H]
+            # else:
+            # Fallback to manual projection if render doesn't provide viewspace_points
+            proj_pts, distances = self.project_xyz_to_image(self._xyz, camera)
+            
+            # Create Gaussian-to-pixel mapping
+            gaussian_to_pixel = {
+                'proj_pts': proj_pts,  # (N, 2) - 2D projections
+                'depth': distances,  # (N,) - actual distances from camera
+                'image_size': (H, W)
+            }
+            
+            # Save if path provided
+            if save_path is not None:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torchvision.utils.save_image(rendered_image, save_path)
+                print(f"Clean rendered image saved to: {save_path}")
+            
+        return rendered_image, gaussian_to_pixel
+
+    def assign_label_from_gaussian_to_pixel_mapping(self, mask_tensor: torch.Tensor, gaussian_to_pixel: dict, label_vote_count=None, vis_save_path: str = None):
+        """
+        Assign labels to Gaussians using the pre-computed Gaussian-to-pixel mapping.
+        Optionally visualize projected points over segmentation mask and save to disk.
+        
+        Args:
+            mask_tensor: Segmentation mask tensor (H, W)
+            gaussian_to_pixel: Dict containing 'proj_pts', 'depth', and 'image_size'
+            label_vote_count: Existing vote count tensor for majority voting
+            vis_save_path: Optional path to save visualization image
+            
+        Returns:
+            label_vote_count: Updated vote count tensor
+        """
+        device = self._xyz.device
+        H, W = mask_tensor.shape
+
+        # Get projection points and depth
+        proj_pts = gaussian_to_pixel['proj_pts']  # (N, 2)
+        depth = gaussian_to_pixel['depth']  # (N,)
+        
+        # Convert to integer pixel coordinates
+        u_int = proj_pts[:, 0].round().long()
+        v_int = proj_pts[:, 1].round().long()
+        
+        # Check bounds and valid depth (distances should be positive)
+        valid = (u_int >= 0) & (u_int < W) & (v_int >= 0) & (v_int < H) & (depth > 0)
+        vote_indices = torch.where(valid)[0]
+        label_values = mask_tensor[v_int[valid], u_int[valid]]
+
+        if len(label_values) == 0:
+            return label_vote_count
+        
+        # Remove background (label 0)
+        nonzero = label_values != 0
+        vote_indices = vote_indices[nonzero]
+        label_values = label_values[nonzero]
+
+        # Convert label_values to long dtype for indexing
+        label_values = label_values.long()
+        
+        if len(vote_indices) == 0:
+            return label_vote_count
+        
+        # Apply distance-based filtering for each ball class
+        filtered_vote_indices = []
+        filtered_label_values = []
+        
+        # Get the maximum label number from the mask
+        max_label = int(mask_tensor.max().item())
+        
+        for label_id in range(1, max_label + 1):  # Ball classes start from 1
+            label_mask = (label_values == label_id)
+            if label_mask.any():
+                # Get distances for Gaussians with this label
+                label_vote_indices = vote_indices[label_mask]
+                label_depths = depth[label_vote_indices]
+                
+                if len(label_depths) > 0:
+                    min_distance = label_depths.min()
+                    max_distance = label_depths.max()
+                    distance_range = max_distance - min_distance
+                    
+                    # Calculate adaptive margin: 0.35 * distance range
+                    adaptive_margin = 0.3 * distance_range
+                    
+                    # Keep only Gaussians within adaptive distance margin
+                    close_mask = label_depths <= (min_distance + adaptive_margin)
+                    
+                    filtered_vote_indices.append(label_vote_indices[close_mask])
+                    filtered_label_values.append(label_values[label_mask][close_mask])
+        
+        # Combine filtered results
+        if filtered_vote_indices:
+            vote_indices = torch.cat(filtered_vote_indices)
+            label_values = torch.cat(filtered_label_values)
+        else:
+            return label_vote_count
+        
+        num_points = self._xyz.shape[0]
+        max_class_id = int(mask_tensor.max().item())
+
+        if label_vote_count is None:
+            label_vote_count = torch.zeros((num_points, max_class_id + 1), dtype=torch.long, device=device)
+
+        # Check bounds before indexing
+        if vote_indices.max() >= num_points:
+            valid_votes = vote_indices < num_points
+            vote_indices = vote_indices[valid_votes]
+            label_values = label_values[valid_votes]
+        
+        if label_values.max() >= max_class_id + 1:
+            valid_labels = label_values < max_class_id + 1
+            vote_indices = vote_indices[valid_labels]
+            label_values = label_values[valid_labels]
+        
+        # Update vote count
+        if len(vote_indices) > 0:
+            label_vote_count[vote_indices, label_values] += 1
+
+        # Note: Depth-based outlier detection will be applied globally after all cameras
+        
+        # ========= Visualization part =========
+        if vis_save_path is not None:
+            import matplotlib
+            matplotlib.use('Agg')  # Use non-interactive backend for server environments
+
+            mask_np = mask_tensor.detach().cpu().numpy()
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.imshow(mask_np, cmap='gray')
+
+            # Convert all projected points to CPU for visualization
+            u_all = proj_pts[:, 0].detach().cpu().numpy()
+            v_all = proj_pts[:, 1].detach().cpu().numpy()
+            
+            # Show all projected Gaussian points in light gray
+            ax.scatter(u_all, v_all, s=0.5, color='lightgray', alpha=0.3, label='All projected Gaussians')
+            
+            # Show points that lie within 2D segmentation balls with colors
+            colors = ['red', 'green', 'blue', 'yellow', 'purple']
+            for label_id in range(1, max_class_id + 1):
+                select = (label_values == label_id)
+                if select.any():
+                    ax.scatter(
+                        proj_pts[vote_indices[select], 0].detach().cpu().numpy(),
+                        proj_pts[vote_indices[select], 1].detach().cpu().numpy(),
+                        s=2,
+                        label=f'Label {label_id} (in segmentation)',
+                        color=colors[(label_id - 1) % len(colors)],
+                        alpha=0.8
+                    )
+            
+            ax.set_title("All Projected 3D Gaussians vs Segmentation Mask (from Gaussian-to-Pixel Mapping)")
+            ax.legend()
+            ax.axis('off')
+            
+            # Ensure debug directory exists
+            debug_dir = os.path.dirname(vis_save_path)
+            if debug_dir:  # Only create if there's a directory path
+                os.makedirs(debug_dir, exist_ok=True)
+            else:  # If no directory, create 'debug' folder
+                os.makedirs("debug", exist_ok=True)
+                vis_save_path = os.path.join("debug", os.path.basename(vis_save_path))
+            
+            plt.savefig(vis_save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            print(f"Visualization saved to: {vis_save_path}")
+
+        return label_vote_count
+
+    def create_labeled_object_manager(self, control_gaussians: 'GaussianModel'):
+        """
+        Create a labeled object manager that maps control points and Gaussians with the same label.
+        This allows applying 6DOF transformations to entire objects (control points + Gaussians).
+        
+        Args:
+            control_gaussians: GaussianModel instance for control points
+            
+        Returns:
+            LabeledObjectManager instance
+        """
+        return LabeledObjectManager(control_gaussians, self)
+
+    def assign_label_from_mask_majority(self, mask_tensor: torch.Tensor, camera: Camera, label_vote_count=None, vis_save_path: str = None):
+        """
+        Use 2D mask to assign semantic labels to Gaussians via majority voting.
+        Optionally visualize projected points over segmentation mask and save to disk.
+        """
+        device = self._xyz.device
+        H, W = mask_tensor.shape
+
+        # Project Gaussians to image space
+        proj_uv, depth = self.project_xyz_to_image(self._xyz, camera)
+        u, v = proj_uv[:, 0], proj_uv[:, 1]
+
+        # Round to nearest integer
+        u_int = u.round().long()
+        v_int = v.round().long()
+
+        # Mask valid points
+        valid = (u_int >= 0) & (u_int < W) & (v_int >= 0) & (v_int < H) & (depth > 0)
+        vote_indices = torch.where(valid)[0]
+        label_values = mask_tensor[v_int[valid], u_int[valid]]
+
+        # Remove background (label 0)
+        nonzero = label_values != 0
+        vote_indices = vote_indices[nonzero]
+        label_values = label_values[nonzero]
+
+        num_points = self._xyz.shape[0]
+        max_class_id = int(mask_tensor.max().item())
+
+        if label_vote_count is None:
+            label_vote_count = torch.zeros((num_points, max_class_id + 1), dtype=torch.long, device=device)
+
+        label_vote_count[vote_indices, label_values] += 1
+
+        # ========= Visualization =========
+        if vis_save_path is not None:
+            import matplotlib
+            matplotlib.use('Agg')  
+
+            mask_np = mask_tensor.detach().cpu().numpy()
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.imshow(mask_np, cmap='gray')
+
+            # Convert all projected points to CPU for visualization
+            u_all = u.detach().cpu().numpy()
+            v_all = v.detach().cpu().numpy()
+            
+            # Show all projected Gaussian points in light gray
+            ax.scatter(u_all, v_all, s=0.5, color='lightgray', alpha=0.3, label='All projected Gaussians')
+            
+            # Show points that lie within 2D segmentation balls with colors
+            colors = ['red', 'green', 'blue', 'yellow', 'purple']
+            for label_id in range(1, max_class_id + 1):
+                select = (label_values == label_id)
+                if select.any():
+                    ax.scatter(
+                        u[valid][nonzero][select].detach().cpu().numpy(),
+                        v[valid][nonzero][select].detach().cpu().numpy(),
+                        s=2,
+                        label=f'Label {label_id} (in segmentation)',
+                        color=colors[(label_id - 1) % len(colors)],
+                        alpha=0.8
+                    )
+
+            ax.set_title("All Projected 3D Gaussians vs Segmentation Mask")
+            ax.legend()
+            ax.axis('off')
+            os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
+            plt.savefig(vis_save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        return label_vote_count
+
+    def color_gaussians_by_label(self):
+        """
+        Use _label to color _features_dc as visual indicator:
+        label 1 → red, 2 → green, 3 → blue
+        """
+        if not hasattr(self, "_label") or self._label is None:
+            print("[Warning] No labels found on gaussians. Skipping coloring.")
+            return
+
+        with torch.no_grad():
+            f_dc = self._features_dc  # shape: (N, 1, 3)
+            labels = self._label      # shape: (N,)
+
+            label_color_map = {
+                1: torch.tensor([1.0, 0.0, 0.0], device=f_dc.device),  # Red
+                2: torch.tensor([0.0, 1.0, 0.0], device=f_dc.device),  # Green
+                3: torch.tensor([0.0, 0.0, 1.0], device=f_dc.device),  # Blue
+            }
+
+            for class_id, color in label_color_map.items():
+                mask = (labels == class_id)
+                if mask.any():
+                    f_dc[mask] = color.view(1, 1, 3).expand_as(f_dc[mask])
 
 class StandardGaussianModel(GaussianModel):
     def __init__(self, sh_degree: int, fea_dim=0, with_motion_mask=True, all_the_same=False):
@@ -493,3 +957,290 @@ class StandardGaussianModel(GaussianModel):
     def get_scaling(self):
         scaling = self._scaling.mean()[None, None].expand_as(self._scaling) if self.all_the_same else self._scaling.mean(dim=1, keepdim=True).expand_as(self._scaling)
         return self.scaling_activation(scaling)
+
+
+class LabeledObject(nn.Module):
+    """
+    Represents a single labeled object containing control points and Gaussians with the same label.
+    This class wraps both control points and Gaussians, sharing the same coordinate space.
+    """
+    
+    def __init__(self, label: int, control_gaussians: 'GaussianModel', gaussians: 'GaussianModel', 
+                 control_indices: torch.Tensor, gaussian_indices: torch.Tensor):
+        """
+        Args:
+            label: The label ID for this object
+            control_gaussians: Reference to the control Gaussian model
+            gaussians: Reference to the scene Gaussian model
+            control_indices: Indices of control points belonging to this object
+            gaussian_indices: Indices of Gaussians belonging to this object
+        """
+        super().__init__()
+        
+        self.label = label
+        self.control_gaussians = control_gaussians
+        self.gaussians = gaussians
+        self.control_indices = control_indices
+        self.gaussian_indices = gaussian_indices
+        
+        # Calculate object center (average of all points)
+        control_centers = control_gaussians._xyz[control_indices].mean(dim=0)
+        gaussian_centers = gaussians._xyz[gaussian_indices].mean(dim=0)
+        self.center = (control_centers + gaussian_centers) / 2
+        
+        # Initialize transformation parameters (shared by all control points and Gaussians)
+        device = control_gaussians._xyz.device
+        self.translation = nn.Parameter(torch.zeros(3, device=device))
+        self.rotation = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0], device=device))  # quaternion (w, x, y, z)
+        
+        print(f"Created LabeledObject {label}: {len(control_indices)} control points, {len(gaussian_indices)} Gaussians")
+    
+    def get_control_xyz(self) -> torch.Tensor:
+        """Get positions of control points for this object."""
+        return self.control_gaussians._xyz[self.control_indices]
+    
+    def get_gaussian_xyz(self) -> torch.Tensor:
+        """Get positions of Gaussians for this object."""
+        return self.gaussians._xyz[self.gaussian_indices]
+    
+    def set_control_xyz(self, xyz: torch.Tensor):
+        """Set positions of control points for this object."""
+        self.control_gaussians._xyz.data[self.control_indices] = xyz
+    
+    def set_gaussian_xyz(self, xyz: torch.Tensor):
+        """Set positions of Gaussians for this object."""
+        self.gaussians._xyz.data[self.gaussian_indices] = xyz
+    
+    def apply_transformation(self):
+        """Apply the current transformation to all control points and Gaussians."""
+        # Normalize quaternion
+        rotation_quat = self.rotation / torch.norm(self.rotation)
+        
+        # Convert quaternion to rotation matrix
+        rotation_matrix = self._quaternion_to_rotation_matrix(rotation_quat)
+        
+        # Apply transformation to control points
+        control_points = self.get_control_xyz()
+        centered_control = control_points - self.center
+        rotated_control = torch.matmul(centered_control, rotation_matrix.T)
+        transformed_control = rotated_control + self.center + self.translation
+        self.set_control_xyz(transformed_control)
+        
+        # Apply transformation to Gaussians
+        gaussian_points = self.get_gaussian_xyz()
+        centered_gaussian = gaussian_points - self.center
+        rotated_gaussian = torch.matmul(centered_gaussian, rotation_matrix.T)
+        transformed_gaussian = rotated_gaussian + self.center + self.translation
+        self.set_gaussian_xyz(transformed_gaussian)
+    
+    def _quaternion_to_rotation_matrix(self, q: torch.Tensor) -> torch.Tensor:
+        """Convert quaternion to rotation matrix."""
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        
+        # Normalize quaternion
+        norm = torch.sqrt(w*w + x*x + y*y + z*z)
+        w, x, y, z = w/norm, x/norm, y/norm, z/norm
+        
+        # Convert to rotation matrix
+        R = torch.stack([
+            torch.stack([1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)]),
+            torch.stack([2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)]),
+            torch.stack([2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)])
+        ])
+        
+        return R
+    
+    def reset_transformation(self):
+        """Reset transformation to identity."""
+        self.translation.data.zero_()
+        self.rotation.data = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.translation.device)
+        self.apply_transformation()
+    
+    def get_info(self) -> dict:
+        """Get information about this object."""
+        return {
+            'label': self.label,
+            'num_control_points': len(self.control_indices),
+            'num_gaussians': len(self.gaussian_indices),
+            'center': self.center.detach().cpu().numpy(),
+            'translation': self.translation.detach().cpu().numpy(),
+            'rotation_quat': self.rotation.detach().cpu().numpy()
+        }
+    
+    def learn_transformation_to_target(self, target_obj: 'LabeledObject', num_iterations: int = 100, lr: float = 0.01):
+        """
+        Learn a 6DOF transformation to move this LabeledObject to the target LabeledObject's position.
+        This operates at the LabeledObject level - the learned transformation parameters are shared
+        by all Gaussians and control points within this object.
+        
+        Args:
+            target_obj: Target LabeledObject to move towards
+            num_iterations: Number of optimization iterations
+            lr: Learning rate
+            
+        Returns:
+            loss_history: List of losses during optimization
+        """
+        import torch.optim as optim
+        
+        # Create optimizer for the shared transformation parameters
+        optimizer = optim.Adam([self.translation, self.rotation], lr=lr)
+        
+        # Get target positions
+        target_control_xyz = target_obj.get_control_xyz().detach()
+        target_gaussian_xyz = target_obj.get_gaussian_xyz().detach()
+        
+        # Store original positions (before any transformation)
+        original_control_xyz = self.get_control_xyz().clone().detach()
+        original_gaussian_xyz = self.get_gaussian_xyz().clone().detach()
+        original_center = self.center.clone().detach()
+        
+        loss_history = []
+        
+        print(f"Learning 6DOF transformation from object {self.label} to object {target_obj.label}...")
+        
+        for i in range(num_iterations):
+            optimizer.zero_grad()
+            
+            # Apply current transformation parameters (without modifying underlying data)
+            # Normalize quaternion
+            rotation_quat = self.rotation / torch.norm(self.rotation)
+            rotation_matrix = self._quaternion_to_rotation_matrix(rotation_quat)
+            
+            # Transform control points (from original positions)
+            centered_control = original_control_xyz - original_center
+            rotated_control = torch.matmul(centered_control, rotation_matrix.T)
+            transformed_control = rotated_control + original_center + self.translation
+            
+            # Transform Gaussians (from original positions)
+            centered_gaussian = original_gaussian_xyz - original_center
+            rotated_gaussian = torch.matmul(centered_gaussian, rotation_matrix.T)
+            transformed_gaussian = rotated_gaussian + original_center + self.translation
+            
+            # Compute loss (MSE between transformed and target positions)
+            loss = torch.mean((transformed_control - target_control_xyz) ** 2) + \
+                   torch.mean((transformed_gaussian - target_gaussian_xyz) ** 2)
+            
+            loss.backward()
+            optimizer.step()
+            
+            loss_history.append(loss.item())
+            
+            if (i + 1) % 10 == 0:
+                print(f"  Iteration {i+1}/{num_iterations}, Loss: {loss.item():.6f}")
+        
+        # Apply the final learned transformation
+        self.set_control_xyz(original_control_xyz)
+        self.set_gaussian_xyz(original_gaussian_xyz)
+        self.apply_transformation()
+        
+        print(f"✅ Learned transformation: translation={self.translation.detach().cpu().numpy()}, "
+              f"rotation={self.rotation.detach().cpu().numpy()}")
+        
+        return loss_history
+    
+    def copy_transformation_from(self, source_obj: 'LabeledObject'):
+        """
+        Copy the transformation parameters from another LabeledObject.
+        This is useful for transferring learned transformations.
+        
+        Args:
+            source_obj: Source LabeledObject to copy transformation from
+        """
+        self.translation.data = source_obj.translation.data.clone()
+        self.rotation.data = source_obj.rotation.data.clone()
+        self.center = source_obj.center.clone()
+        print(f"Copied transformation from object {source_obj.label} to object {self.label}")
+
+
+class LabeledObjectManager(nn.Module):
+    """
+    Manages multiple LabeledObject instances.
+    Each labeled object is a separate class instance containing control points and Gaussians with the same label.
+    """
+    
+    def __init__(self, control_gaussians: 'GaussianModel', gaussians: 'GaussianModel'):
+        """
+        Args:
+            control_gaussians: GaussianModel instance for control points
+            gaussians: GaussianModel instance for scene Gaussians
+        """
+        super().__init__()
+        
+        # Get labels from both models
+        control_labels = control_gaussians._label
+        gaussian_labels = gaussians._label
+        
+        # Get unique labels (excluding background label 0)
+        unique_labels = torch.unique(torch.cat([control_labels, gaussian_labels]))
+        unique_labels = unique_labels[unique_labels > 0]
+        
+        print(f"Found {len(unique_labels)} labeled objects: {unique_labels.tolist()}")
+        
+        # Create a LabeledObject instance for each label
+        self.objects = nn.ModuleDict()
+        
+        for label in unique_labels:
+            label_item = label.item()
+            
+            # Find control points and Gaussians with this label
+            control_mask = (control_labels == label)
+            gaussian_mask = (gaussian_labels == label)
+            
+            control_indices = torch.where(control_mask)[0]
+            gaussian_indices = torch.where(gaussian_mask)[0]
+            
+            if len(control_indices) > 0 and len(gaussian_indices) > 0:
+                # Create a LabeledObject for this label
+                labeled_obj = LabeledObject(
+                    label_item, control_gaussians, gaussians,
+                    control_indices, gaussian_indices
+                )
+                self.objects[str(label_item)] = labeled_obj
+    
+    def get_object(self, label: int) -> LabeledObject:
+        """Get the LabeledObject instance for a specific label."""
+        label_key = str(label)
+        if label_key in self.objects:
+            return self.objects[label_key]
+        else:
+            print(f"Warning: Object with label {label} not found")
+            return None
+    
+    def apply_transformation(self, label: int):
+        """Apply transformation to a specific object."""
+        obj = self.get_object(label)
+        if obj is not None:
+            obj.apply_transformation()
+    
+    def apply_all_transformations(self):
+        """Apply transformations to all objects."""
+        for obj in self.objects.values():
+            obj.apply_transformation()
+    
+    def set_transformation(self, label: int, translation: torch.Tensor, rotation_quat: torch.Tensor):
+        """Set transformation for a specific object and apply it."""
+        obj = self.get_object(label)
+        if obj is not None:
+            obj.translation.data = translation
+            obj.rotation.data = rotation_quat
+            obj.apply_transformation()
+    
+    def reset_transformation(self, label: int):
+        """Reset transformation for a specific object."""
+        obj = self.get_object(label)
+        if obj is not None:
+            obj.reset_transformation()
+    
+    def reset_all_transformations(self):
+        """Reset all transformations to identity."""
+        for obj in self.objects.values():
+            obj.reset_transformation()
+    
+    def get_object_info(self) -> dict:
+        """Get information about all objects."""
+        return {int(label): obj.get_info() for label, obj in self.objects.items()}
+    
+    def get_all_labels(self) -> list:
+        """Get all object labels."""
+        return [int(label) for label in self.objects.keys()]

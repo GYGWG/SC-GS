@@ -9,6 +9,17 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+# multi-threading params
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import cv2
+cv2.setNumThreads(0)
+
 import os
 # os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
 import time
@@ -33,6 +44,7 @@ import datetime
 from PIL import Image
 from train_gui_utils import DeformKeypoints
 from scipy.spatial.transform import Rotation as R
+import json
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -187,6 +199,8 @@ class GUI:
         self.progress_bar = tqdm.tqdm(range(opt.iterations), desc="Training progress")
         self.smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
 
+        # self.label_dict = self.load_all_labels_from_folder(args.label_folder, device="cuda")
+
         # For UI
         self.visualization_mode = 'RGB'
 
@@ -233,6 +247,33 @@ class GUI:
             dpg.create_context()
             self.register_dpg()
             self.test_step()
+
+    def load_all_labels_from_folder(self, label_folder, device="cuda"):
+        label_dict = {}
+        for fname in sorted(os.listdir(label_folder)):
+            if fname.endswith("_label.json"):
+                # Handle both "image_000_label.json" and "cam000_label.json" formats
+                key_str = os.path.splitext(fname)[0].replace("_label", "")
+                if key_str.startswith("cam"):
+                    # Format: cam000 -> extract 000
+                    key_index = int(key_str[3:])  # Remove "cam" prefix
+                elif "_" in key_str:
+                    # Format: image_000 -> extract 000
+                    key_index = int(key_str.split("_")[1])
+                else:
+                    # Try to extract number from end of string
+                    import re
+                    numbers = re.findall(r'\d+', key_str)
+                    if numbers:
+                        key_index = int(numbers[-1])  # Use last number found
+                    else:
+                        print(f"Warning: Could not parse index from filename: {fname}")
+                        continue
+                with open(os.path.join(label_folder, fname), "r") as f:
+                    data = json.load(f)
+                    label_tensor = torch.tensor(data["label"], dtype=torch.long, device=device)
+                    label_dict[key_index] = label_tensor
+        return label_dict
 
     def animation_initialize(self, use_traj=True):
         from lap_deform import LapDeform
@@ -1002,6 +1043,736 @@ class GUI:
         Image.fromarray(img_begin).save(os.path.join(self.args.model_path, 'traj_start.png'))
         Image.fromarray(img_end).save(os.path.join(self.args.model_path, 'traj_end.png'))
 
+    def create_labeled_object_manager(self):
+        """Create a labeled object manager for interactive manipulation."""
+        if not hasattr(self, 'gaussians') or not hasattr(self, 'deform'):
+            print("Warning: Gaussians or deform model not available")
+            return None
+        
+        try:
+            # Create the manager using the Gaussian model classes directly
+            self.object_manager = self.gaussians.create_labeled_object_manager(
+                self.deform.deform.as_gaussians
+            )
+            
+            print("Created labeled object manager")
+            return self.object_manager
+            
+        except Exception as e:
+            print(f"Error creating labeled object manager: {e}")
+            return None
+    
+    def translate_object(self, label: int, delta_x: float, delta_y: float, delta_z: float):
+        """Translate an object by the given delta."""
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        obj = self.object_manager.get_object(label)
+        if obj is None:
+            print(f"Object {label} not found")
+            return
+        
+        # Apply delta
+        delta_translation = torch.tensor([delta_x, delta_y, delta_z], device=obj.translation.device)
+        new_translation = obj.translation + delta_translation
+        
+        # Update transformation (this automatically applies the transformation)
+        self.object_manager.set_transformation(label, new_translation, obj.rotation)
+        print(f"Translated object {label} by ({delta_x}, {delta_y}, {delta_z})")
+    
+    def rotate_object(self, label: int, axis: str, angle_degrees: float):
+        """
+        Rotate an object around the specified axis.
+        
+        Args:
+            label: Object label
+            axis: "x", "y", or "z"
+            angle_degrees: Rotation angle in degrees
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        obj = self.object_manager.get_object(label)
+        if obj is None:
+            print(f"Object {label} not found")
+            return
+        
+        # Convert angle to radians
+        angle_rad = np.radians(angle_degrees)
+        
+        # Create rotation quaternion
+        if axis.lower() == 'x':
+            rotation_quat = torch.tensor([
+                np.cos(angle_rad/2), np.sin(angle_rad/2), 0, 0
+            ], device=obj.rotation.device)
+        elif axis.lower() == 'y':
+            rotation_quat = torch.tensor([
+                np.cos(angle_rad/2), 0, np.sin(angle_rad/2), 0
+            ], device=obj.rotation.device)
+        elif axis.lower() == 'z':
+            rotation_quat = torch.tensor([
+                np.cos(angle_rad/2), 0, 0, np.sin(angle_rad/2)
+            ], device=obj.rotation.device)
+        else:
+            print(f"Invalid axis: {axis}. Use 'x', 'y', or 'z'")
+            return
+        
+        # Apply rotation
+        new_rotation = self._quaternion_multiply(obj.rotation, rotation_quat)
+        
+        # Update transformation (this automatically applies the transformation)
+        self.object_manager.set_transformation(label, obj.translation, new_rotation)
+        print(f"Rotated object {label} by {angle_degrees}° around {axis}-axis")
+    
+    def set_object_position(self, label: int, x: float, y: float, z: float):
+        """Set absolute position of an object."""
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        obj = self.object_manager.get_object(label)
+        if obj is None:
+            print(f"Object {label} not found")
+            return
+        
+        # Set new position
+        new_translation = torch.tensor([x, y, z], device=obj.translation.device)
+        
+        # Update transformation (this automatically applies the transformation)
+        self.object_manager.set_transformation(label, new_translation, obj.rotation)
+        print(f"Set object {label} position to ({x}, {y}, {z})")
+    
+    def reset_object(self, label: int):
+        """Reset an object to its original position and orientation."""
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        self.object_manager.reset_transformation(label)
+        print(f"Reset object {label} to original position")
+    
+    def reset_all_objects(self):
+        """Reset all objects to their original positions and orientations."""
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        self.object_manager.reset_all_transformations()
+        print("Reset all objects to original positions")
+    
+    def get_object_status(self) -> dict:
+        """Get current status of all objects."""
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Object manager not available. Call create_labeled_object_manager() first.")
+            return {}
+        
+        # Use the get_object_info method from LabeledObjectManager
+        return self.object_manager.get_object_info()
+    
+    def print_object_status(self):
+        """Print current status of all objects."""
+        status = self.get_object_status()
+        if not status:
+            return
+        
+        print("\n=== Object Status ===")
+        for label, data in status.items():
+            print(f"Object {label}:")
+            print(f"  Center: {data['center']}")
+            print(f"  Translation: {data['translation']}")
+            print(f"  Rotation: {data['rotation_quat']}")
+        print("===================\n")
+    
+    def _quaternion_multiply(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Multiply two quaternions."""
+        w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+        w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+        
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+        
+        return torch.stack([w, x, y, z])
+    
+    
+    
+    def learn_6dof_transformation(self, source_label: int, target_label: int, 
+                                 num_iterations: int = 100, lr: float = 0.01,
+                                 camera_idx: int = 0, save_visualizations: bool = True):
+        """
+        Learn a 6DOF transformation to move one object to another's position by rendering
+        Gaussians to images and calculating losses with ground truth images.
+        
+        Args:
+            source_label: Label of the object to move (e.g., 1 for red ball)
+            target_label: Label of the object to move to (e.g., 3 for blue ball)
+            num_iterations: Number of optimization iterations
+            lr: Learning rate for optimization
+            camera_idx: Camera index to use for rendering
+            save_visualizations: Whether to save intermediate visualizations
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Warning: Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        # Get source and target objects
+        source_obj = self.object_manager.get_object(source_label)
+        target_obj = self.object_manager.get_object(target_label)
+        
+        if source_obj is None:
+            print(f"Warning: Source object with label {source_label} not found")
+            return
+        
+        if target_obj is None:
+            print(f"Warning: Target object with label {target_label} not found")
+            return
+        
+        print(f"Learning 6DOF transformation to move object {source_label} to object {target_label}'s position...")
+        print(f"  Source object: {len(source_obj.control_indices)} control points, {len(source_obj.gaussian_indices)} Gaussians")
+        print(f"  Target object: {len(target_obj.control_indices)} control points, {len(target_obj.gaussian_indices)} Gaussians")
+        
+        # Get camera for rendering
+        if camera_idx >= len(self.cameras):
+            print(f"Warning: Camera index {camera_idx} out of range. Using camera 0.")
+            camera_idx = 0
+        
+        camera = self.cameras[camera_idx]
+        
+        # Create optimizer for source object's transformation parameters
+        optimizer = torch.optim.Adam([source_obj.translation, source_obj.rotation], lr=lr)
+        
+        # Store original positions for reference
+        original_source_control = source_obj.control_gaussians._xyz[source_obj.control_indices].clone().detach()
+        original_source_gaussian = source_obj.gaussians._xyz[source_obj.gaussian_indices].clone().detach()
+        
+        # Get target object's current center as target position
+        target_center = target_obj.center.clone().detach()
+        
+        print(f"  Target center: {target_center.cpu().numpy()}")
+        print(f"  Starting optimization with {num_iterations} iterations...")
+        
+        loss_history = []
+        
+        for iteration in range(num_iterations):
+            optimizer.zero_grad()
+            
+            # Apply current transformation to source object
+            source_obj.apply_transformation()
+            
+            # Render the scene with current transformation
+            with torch.no_grad():
+                # Render the full scene
+                rendered_image = self.render(camera)
+                
+                # Create a mask for the source object only
+                source_mask = self._create_object_mask(source_label, camera)
+                
+                # Create a mask for the target object only  
+                target_mask = self._create_object_mask(target_label, camera)
+            
+            # Calculate loss between source and target object positions
+            # We'll use multiple loss components:
+            
+            # 1. Position loss: minimize distance between object centers
+            current_source_center = source_obj.center
+            position_loss = torch.nn.functional.mse_loss(current_source_center, target_center)
+            
+            # 2. Rendering loss: minimize difference in rendered appearance
+            if source_mask.sum() > 0 and target_mask.sum() > 0:
+                # Extract object regions from rendered image
+                source_region = rendered_image * source_mask.unsqueeze(-1)
+                target_region = rendered_image * target_mask.unsqueeze(-1)
+                
+                # Calculate L1 loss between object regions
+                rendering_loss = torch.nn.functional.l1_loss(source_region, target_region)
+            else:
+                rendering_loss = torch.tensor(0.0, device=source_obj.translation.device)
+            
+            # 3. Smoothness loss: prevent extreme transformations
+            smoothness_loss = torch.norm(source_obj.translation) * 0.01
+            
+            # Total loss
+            total_loss = position_loss + rendering_loss + smoothness_loss
+            
+            # Backward pass
+            total_loss.backward()
+            optimizer.step()
+            
+            loss_history.append(total_loss.item())
+            
+            # Print progress
+            if iteration % 10 == 0 or iteration == num_iterations - 1:
+                print(f"  Iteration {iteration:3d}: Total Loss = {total_loss.item():.6f} "
+                      f"(Position: {position_loss.item():.6f}, Rendering: {rendering_loss.item():.6f}, "
+                      f"Smoothness: {smoothness_loss.item():.6f})")
+                
+                # Save visualization if requested
+                if save_visualizations and iteration % 20 == 0:
+                    self._save_6dof_visualization(source_label, target_label, camera, iteration, 
+                                                rendered_image, source_mask, target_mask)
+        
+        print(f"✅ 6DOF learning completed!")
+        print(f"  Final transformation - Translation: {source_obj.translation.data.cpu().numpy()}")
+        print(f"  Final transformation - Rotation: {source_obj.rotation.data.cpu().numpy()}")
+        print(f"  Final source center: {source_obj.center.cpu().numpy()}")
+        print(f"  Target center: {target_center.cpu().numpy()}")
+        print(f"  Final distance: {torch.norm(source_obj.center - target_center).item():.4f}")
+        
+        return loss_history
+    
+    def _create_object_mask(self, label: int, camera) -> torch.Tensor:
+        """
+        Create a binary mask for a specific object in the rendered image.
+        
+        Args:
+            label: Object label
+            camera: Camera for rendering
+            
+        Returns:
+            Binary mask tensor of shape (H, W)
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            return torch.zeros(camera.image_height, camera.image_width, device=camera.device)
+        
+        obj = self.object_manager.get_object(label)
+        if obj is None:
+            return torch.zeros(camera.image_height, camera.image_width, device=camera.device)
+        
+        # Project object's Gaussians to image space
+        obj_xyz = self.gaussians._xyz[obj.gaussian_indices]
+        proj_uv, depth = self.gaussians.project_xyz_to_image(obj_xyz, camera)
+        
+        # Create mask
+        mask = torch.zeros(camera.image_height, camera.image_width, device=camera.device)
+        
+        # Round to nearest integer pixel coordinates
+        u_int = proj_uv[:, 0].round().long()
+        v_int = proj_uv[:, 1].round().long()
+        
+        # Filter valid projections
+        valid = (u_int >= 0) & (u_int < camera.image_width) & \
+                (v_int >= 0) & (v_int < camera.image_height) & (depth > 0)
+        
+        if valid.sum() > 0:
+            mask[v_int[valid], u_int[valid]] = 1.0
+        
+        return mask
+    
+    def _save_6dof_visualization(self, source_label: int, target_label: int, camera, 
+                                iteration: int, rendered_image: torch.Tensor,
+                                source_mask: torch.Tensor, target_mask: torch.Tensor):
+        """Save visualization of 6DOF learning progress."""
+        import matplotlib.pyplot as plt
+        import os
+        
+        # Create debug directory
+        debug_dir = "debug/6dof_learning"
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Convert tensors to numpy for visualization
+        rendered_np = rendered_image.detach().cpu().numpy()
+        source_mask_np = source_mask.detach().cpu().numpy()
+        target_mask_np = target_mask.detach().cpu().numpy()
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Rendered image
+        axes[0, 0].imshow(rendered_np)
+        axes[0, 0].set_title(f"Rendered Image (Iteration {iteration})")
+        axes[0, 0].axis('off')
+        
+        # Source object mask
+        axes[0, 1].imshow(source_mask_np, cmap='Reds')
+        axes[0, 1].set_title(f"Source Object {source_label} Mask")
+        axes[0, 1].axis('off')
+        
+        # Target object mask
+        axes[1, 0].imshow(target_mask_np, cmap='Blues')
+        axes[1, 0].set_title(f"Target Object {target_label} Mask")
+        axes[1, 0].axis('off')
+        
+        # Overlay
+        overlay = rendered_np.copy()
+        overlay[source_mask_np > 0] = [1, 0, 0]  # Red for source
+        overlay[target_mask_np > 0] = [0, 0, 1]  # Blue for target
+        axes[1, 1].imshow(overlay)
+        axes[1, 1].set_title("Object Overlay")
+        axes[1, 1].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save
+        save_path = os.path.join(debug_dir, f"6dof_iter_{iteration:03d}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        if iteration % 50 == 0:  # Print less frequently
+            print(f"    Saved visualization: {save_path}")
+    
+    def learn_move_red_to_blue(self, num_iterations: int = 100, lr: float = 0.01):
+        """Convenience method to learn moving red ball (label 1) to blue ball (label 3) position."""
+        print("Learning to move red ball to blue ball position...")
+        return self.learn_6dof_transformation(1, 3, num_iterations, lr)
+    
+    def learn_move_blue_to_red(self, num_iterations: int = 100, lr: float = 0.01):
+        """Convenience method to learn moving blue ball (label 3) to red ball (label 1) position."""
+        print("Learning to move blue ball to red ball position...")
+        return self.learn_6dof_transformation(3, 1, num_iterations, lr)
+    
+    def generate_ground_truth_centered_image(self, camera_idx: int = 0, save_path: str = None):
+        """
+        Generate a ground truth rendered image where all three balls are translated to the center.
+        This serves as the target image for 6DOF learning.
+        
+        Args:
+            camera_idx: Camera index to use for rendering
+            save_path: Path to save the ground truth image (optional)
+            
+        Returns:
+            Rendered image tensor and camera used
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Warning: Object manager not available. Call create_labeled_object_manager() first.")
+            return None, None
+        
+        print("Generating ground truth image with all balls centered...")
+        
+        # Get camera
+        if camera_idx >= len(self.cameras):
+            print(f"Warning: Camera index {camera_idx} out of range. Using camera 0.")
+            camera_idx = 0
+        
+        camera = self.cameras[camera_idx]
+        
+        # Calculate the center of the scene (average of all object centers)
+        all_centers = []
+        for label in [1, 2, 3]:  # All three balls
+            obj = self.object_manager.get_object(label)
+            if obj is not None:
+                all_centers.append(obj.center)
+        
+        if len(all_centers) == 0:
+            print("Warning: No objects found to center")
+            return None, None
+        
+        # Calculate scene center
+        scene_center = torch.stack(all_centers).mean(dim=0)
+        print(f"Scene center: {scene_center.cpu().numpy()}")
+        
+        # Store original transformations
+        original_transformations = {}
+        for label in [1, 2, 3]:
+            obj = self.object_manager.get_object(label)
+            if obj is not None:
+                original_transformations[label] = {
+                    'translation': obj.translation.data.clone(),
+                    'rotation': obj.rotation.data.clone()
+                }
+        
+        try:
+            # Move all objects to the center
+            for label in [1, 2, 3]:
+                obj = self.object_manager.get_object(label)
+                if obj is not None:
+                    # Calculate translation needed to move object to center
+                    current_center = obj.center
+                    translation_needed = scene_center - current_center
+                    
+                    # Set new transformation (keep rotation, update translation)
+                    obj.translation.data = translation_needed
+                    obj.rotation.data = torch.tensor([1.0, 0.0, 0.0, 0.0], device=obj.translation.device)  # Identity rotation
+                    
+                    # Apply transformation
+                    obj.apply_transformation()
+                    
+                    print(f"  Moved object {label} to center: translation = {translation_needed.cpu().numpy()}")
+            
+            # Render the ground truth image
+            print("Rendering ground truth image...")
+            with torch.no_grad():
+                ground_truth_image = self.render(camera)
+            
+            # Save the image if path provided
+            if save_path is not None:
+                import matplotlib.pyplot as plt
+                import os
+                
+                # Create directory if needed
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                
+                # Convert to numpy and save
+                image_np = ground_truth_image.detach().cpu().numpy()
+                plt.figure(figsize=(10, 10))
+                plt.imshow(image_np)
+                plt.title("Ground Truth: All Balls Centered")
+                plt.axis('off')
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                
+                print(f"Ground truth image saved to: {save_path}")
+            
+            return ground_truth_image, camera
+            
+        finally:
+            # Restore original transformations
+            print("Restoring original object positions...")
+            for label, original_transform in original_transformations.items():
+                obj = self.object_manager.get_object(label)
+                if obj is not None:
+                    obj.translation.data = original_transform['translation']
+                    obj.rotation.data = original_transform['rotation']
+                    obj.apply_transformation()
+            
+            print("Original positions restored.")
+    
+    def learn_move_all_to_center(self, num_iterations: int = 100, lr: float = 0.01, camera_idx: int = 0):
+        """
+        Learn 6DOF transformations to move all balls to the center using ground truth image.
+        
+        Args:
+            num_iterations: Number of optimization iterations
+            lr: Learning rate for optimization
+            camera_idx: Camera index to use for rendering
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Warning: Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        print("Learning to move all balls to center using ground truth image...")
+        
+        # Generate ground truth image
+        ground_truth_image, camera = self.generate_ground_truth_centered_image(
+            camera_idx=camera_idx, 
+            save_path="debug/ground_truth_centered.png"
+        )
+        
+        if ground_truth_image is None:
+            print("Failed to generate ground truth image")
+            return
+        
+        # Get all objects
+        objects = []
+        for label in [1, 2, 3]:
+            obj = self.object_manager.get_object(label)
+            if obj is not None:
+                objects.append((label, obj))
+        
+        if len(objects) == 0:
+            print("No objects found to optimize")
+            return
+        
+        # Create optimizers for all objects
+        optimizers = {}
+        for label, obj in objects:
+            optimizers[label] = torch.optim.Adam([obj.translation, obj.rotation], lr=lr)
+        
+        print(f"Optimizing {len(objects)} objects with {num_iterations} iterations...")
+        
+        loss_history = []
+        
+        for iteration in range(num_iterations):
+            # Zero gradients for all optimizers
+            for optimizer in optimizers.values():
+                optimizer.zero_grad()
+            
+            # Apply transformations to all objects
+            for label, obj in objects:
+                obj.apply_transformation()
+            
+            # Render current scene
+            with torch.no_grad():
+                current_image = self.render(camera)
+            
+            # Calculate loss between current and ground truth images
+            image_loss = torch.nn.functional.mse_loss(current_image, ground_truth_image)
+            
+            # Add smoothness loss for all objects
+            smoothness_loss = torch.tensor(0.0, device=current_image.device)
+            for label, obj in objects:
+                smoothness_loss += torch.norm(obj.translation) * 0.01
+            
+            total_loss = image_loss + smoothness_loss
+            
+            # Backward pass
+            total_loss.backward()
+            
+            # Update all optimizers
+            for optimizer in optimizers.values():
+                optimizer.step()
+            
+            loss_history.append(total_loss.item())
+            
+            # Print progress
+            if iteration % 10 == 0 or iteration == num_iterations - 1:
+                print(f"  Iteration {iteration:3d}: Total Loss = {total_loss.item():.6f} "
+                      f"(Image: {image_loss.item():.6f}, Smoothness: {smoothness_loss.item():.6f})")
+                
+                # Save intermediate visualization
+                if iteration % 20 == 0:
+                    self._save_centering_visualization(iteration, current_image, ground_truth_image, camera)
+        
+        print(f"✅ Centering learning completed!")
+        print(f"Final loss: {loss_history[-1]:.6f}")
+        
+        # Print final object positions
+        for label, obj in objects:
+            print(f"  Object {label} center: {obj.center.cpu().numpy()}")
+            print(f"  Object {label} translation: {obj.translation.data.cpu().numpy()}")
+        
+        return loss_history
+    
+    def _save_centering_visualization(self, iteration: int, current_image: torch.Tensor, 
+                                    ground_truth_image: torch.Tensor, camera):
+        """Save visualization of centering learning progress."""
+        import matplotlib.pyplot as plt
+        import os
+        
+        # Create debug directory
+        debug_dir = "debug/centering_learning"
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Convert tensors to numpy
+        current_np = current_image.detach().cpu().numpy()
+        gt_np = ground_truth_image.detach().cpu().numpy()
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Current image
+        axes[0].imshow(current_np)
+        axes[0].set_title(f"Current (Iteration {iteration})")
+        axes[0].axis('off')
+        
+        # Ground truth image
+        axes[1].imshow(gt_np)
+        axes[1].set_title("Ground Truth")
+        axes[1].axis('off')
+        
+        # Difference
+        import numpy as np
+        diff = np.abs(current_np - gt_np)
+        axes[2].imshow(diff)
+        axes[2].set_title("Difference")
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save
+        save_path = os.path.join(debug_dir, f"centering_iter_{iteration:03d}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+        if iteration % 50 == 0:
+            print(f"    Saved centering visualization: {save_path}")
+    
+    def create_centered_ground_truth(self, camera_idx: int = 0):
+        """Convenience method to create and save a ground truth image with all balls centered."""
+        print("Creating ground truth image with all balls centered...")
+        ground_truth_image, camera = self.generate_ground_truth_centered_image(
+            camera_idx=camera_idx,
+            save_path="debug/ground_truth_centered.png"
+        )
+        if ground_truth_image is not None:
+            print("✅ Ground truth image created successfully!")
+            return ground_truth_image, camera
+        else:
+            print("❌ Failed to create ground truth image")
+            return None, None
+    
+    def get_object_info(self):
+        """Get information about current objects and their properties."""
+        if not hasattr(self, 'gaussians') or not hasattr(self, 'deform'):
+            print("Warning: Gaussians or deform model not available")
+            return
+        
+        try:
+            gaussian_labels = self.gaussians._label
+            control_labels = self.deform.deform.as_gaussians._label
+            
+            print("\n=== Current Object Information ===")
+            
+            # Count Gaussians by label
+            unique_labels = torch.unique(gaussian_labels)
+            for label in unique_labels:
+                if label > 0:  # Skip background
+                    count = (gaussian_labels == label).sum().item()
+                    color_name = {1: "Red", 2: "Green", 3: "Blue"}.get(label.item(), f"Unknown")
+                    print(f"Object {label.item()} ({color_name}): {count} Gaussians")
+            
+            # Count control points by label
+            print("\nControl Points:")
+            unique_control_labels = torch.unique(control_labels)
+            for label in unique_control_labels:
+                if label > 0:  # Skip background
+                    count = (control_labels == label).sum().item()
+                    color_name = {1: "Red", 2: "Green", 3: "Blue"}.get(label.item(), f"Unknown")
+                    print(f"Object {label.item()} ({color_name}): {count} control points")
+            
+            print("==================================\n")
+            
+        except Exception as e:
+            print(f"Error getting object info: {e}")
+    
+    def learn_object_transformation(self, from_label: int, to_label: int, num_iterations: int = 100, lr: float = 0.01):
+        """
+        Learn a 6DOF transformation to move one LabeledObject to another's position.
+        This operates at the LabeledObject level - the transformation parameters are shared
+        by all Gaussians and control points within the object.
+        
+        Args:
+            from_label: Label of the object to transform
+            to_label: Label of the target object
+            num_iterations: Number of optimization iterations
+            lr: Learning rate
+            
+        Returns:
+            loss_history: List of losses during optimization
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Warning: Object manager not available. Call create_labeled_object_manager() first.")
+            return None
+        
+        from_obj = self.object_manager.get_object(from_label)
+        to_obj = self.object_manager.get_object(to_label)
+        
+        if from_obj is None:
+            print(f"Warning: Object {from_label} not found")
+            return None
+        
+        if to_obj is None:
+            print(f"Warning: Object {to_label} not found")
+            return None
+        
+        # Learn transformation at the LabeledObject level
+        loss_history = from_obj.learn_transformation_to_target(to_obj, num_iterations, lr)
+        
+        return loss_history
+    
+    def copy_object_transformation(self, from_label: int, to_label: int):
+        """
+        Copy transformation parameters from one LabeledObject to another.
+        
+        Args:
+            from_label: Label of the object to receive the transformation
+            to_label: Label of the object to copy transformation from
+        """
+        if not hasattr(self, 'object_manager') or self.object_manager is None:
+            print("Warning: Object manager not available. Call create_labeled_object_manager() first.")
+            return
+        
+        from_obj = self.object_manager.get_object(from_label)
+        to_obj = self.object_manager.get_object(to_label)
+        
+        if from_obj is None or to_obj is None:
+            print(f"Warning: Object not found")
+            return
+        
+        from_obj.copy_transformation_from(to_obj)
+
     # gui mode
     def render(self):
         assert self.gui
@@ -1106,6 +1877,59 @@ class GUI:
         render_pkg_re = render(viewpoint_cam, self.gaussians, self.pipe, self.background, d_xyz, d_rotation, d_scaling, random_bg_color=random_bg_color, d_opacity=d_opacity, d_color=d_color, d_rot_as_res=self.deform.d_rot_as_res)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re["viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
 
+        # Segmentation
+        # if self.iteration == self.opt.iterations_node_rendering - 1:
+        if self.iteration == self.opt.warm_up - 1:
+            print(f"\nAssigning semantic labels at iteration {self.iteration}")
+        
+            # Render clean images for SAM segmentation and get Gaussian-to-pixel mapping
+            print("Rendering clean images for SAM segmentation...")
+            gaussian_to_pixel_mappings = {}
+            render_images_num = 10
+            
+            for cam in self.scene.getTrainCameras().copy():
+                img_idx = cam.uid
+                if img_idx < render_images_num:
+                    clean_image_path = f"clean_rendered/cam{img_idx:03d}.png"
+                    rendered_image, gaussian_to_pixel = self.gaussians.render_clean_image(cam, save_path=clean_image_path)
+                    gaussian_to_pixel_mappings[img_idx] = gaussian_to_pixel
+
+            # Run SAM segmentation on clean rendered images
+            print("Running SAM segmentation on clean rendered images...")
+            from segment_clean_rendered import segment_clean_rendered_images
+            segmentation_results = segment_clean_rendered_images("clean_rendered", "sam_segmented")
+            
+            # Convert segmentation results to label_dict format
+            label_dict = {}
+            for cam_idx, results in segmentation_results.items():
+                label_dict[cam_idx] = torch.from_numpy(results['label_mask']).to(self.gaussians._xyz.device)
+            
+            img_idxs = sorted(label_dict.keys())
+            label_vote_count = None
+
+            for cam in self.scene.getTrainCameras().copy():
+                img_idx = cam.uid
+                
+                if img_idx in img_idxs:
+                    label_tensor = label_dict[img_idx]
+                    gaussian_to_pixel = gaussian_to_pixel_mappings[img_idx]
+                    label_vote_count = self.gaussians.assign_label_from_gaussian_to_pixel_mapping(
+                        label_tensor, gaussian_to_pixel, label_vote_count, 
+                        vis_save_path=f"debug/projected_cam{img_idx:03d}.png"
+                    )
+            
+            if label_vote_count is not None:
+                final_labels = label_vote_count.argmax(dim=1)
+                self.gaussians._label = final_labels
+
+                # Create labeled object manager for interactive manipulation
+                print("Creating labeled object manager...")
+                self.create_labeled_object_manager()
+
+                print("\n[ITER {}] Saving Gaussians with color according to label!".format(self.iteration))
+                self.scene.save(self.iteration)
+                self.deform.save_weights(self.args.model_path, self.iteration)
+
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         if random_bg_color:
@@ -1208,7 +2032,7 @@ class GUI:
                     self.best_lpips = cur_lpips.item()
                     self.best_alex_lpips = cur_alex_lpips.item()
 
-            if self.iteration in self.saving_iterations or self.iteration == self.best_iteration or self.iteration == self.opt.warm_up-1:
+            if self.iteration in self.saving_iterations or self.iteration == self.best_iteration or self.iteration == self.opt.warm_up:
                 print("\n[ITER {}] Saving Gaussians".format(self.iteration))
                 self.scene.save(self.iteration)
                 self.deform.save_weights(self.args.model_path, self.iteration)
@@ -1305,6 +2129,54 @@ class GUI:
         render_pkg_re = render(viewpoint_cam, self.deform.deform.as_gaussians, self.pipe, self.background, d_xyz, d_rot, d_scale, random_bg_color=random_bg_color, d_opacity=d_opacity, d_color=d_color, d_rot_as_res=self.deform.d_rot_as_res)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re["viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
 
+        # Segmentation
+        if self.iteration_node_rendering == self.opt.iterations_node_rendering - 1:
+            print(f"\nAssigning semantic labels at iteration {self.iteration_node_rendering}")
+        
+            # Render clean images for SAM segmentation and get Gaussian-to-pixel mapping
+            print("Rendering clean images for SAM segmentation...")
+            gaussian_to_pixel_mappings = {}
+            render_images_num = 10
+            
+            for cam in self.scene.getTrainCameras().copy():
+                img_idx = cam.uid
+                if img_idx < render_images_num:
+                    clean_image_path = f"clean_rendered/cam{img_idx:03d}.png"
+                    rendered_image, gaussian_to_pixel = self.deform.deform.as_gaussians.render_clean_image(cam, save_path=clean_image_path)
+                    gaussian_to_pixel_mappings[img_idx] = gaussian_to_pixel
+
+            # Run SAM segmentation on clean rendered images
+            print("Running SAM segmentation on clean rendered images...")
+            from segment_clean_rendered import segment_clean_rendered_images
+            segmentation_results = segment_clean_rendered_images("clean_rendered", "sam_segmented")
+            
+            # Convert segmentation results to label_dict format
+            label_dict = {}
+            for cam_idx, results in segmentation_results.items():
+                label_dict[cam_idx] = torch.from_numpy(results['label_mask']).to(self.deform.deform.as_gaussians._xyz.device)
+            
+            img_idxs = sorted(label_dict.keys())
+            label_vote_count = None
+
+            for cam in self.scene.getTrainCameras().copy():
+                img_idx = cam.uid
+                
+                if img_idx in img_idxs:
+                    label_tensor = label_dict[img_idx]
+                    gaussian_to_pixel = gaussian_to_pixel_mappings[img_idx]
+                    label_vote_count = self.deform.deform.as_gaussians.assign_label_from_gaussian_to_pixel_mapping(
+                        label_tensor, gaussian_to_pixel, label_vote_count, 
+                        vis_save_path=f"debug/projected_cam{img_idx:03d}.png"
+                    )
+            
+            if label_vote_count is not None:
+                final_labels = label_vote_count.argmax(dim=1)
+                self.deform.deform.as_gaussians._label = final_labels
+
+                print("\n[ITER {}] Saving Gaussians with color according to label!".format(self.iteration_node_rendering))
+                self.scene.save(self.iteration_node_rendering)
+                self.deform.save_weights(self.args.model_path, self.iteration_node_rendering)
+
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         if random_bg_color:
@@ -1349,11 +2221,15 @@ class GUI:
                 if self.iteration_node_rendering % self.opt.opacity_reset_interval == 0 or (
                         self.dataset.white_background and self.iteration_node_rendering == self.opt.densify_from_iter):
                     self.deform.deform.as_gaussians.reset_opacity()
+                # import pdb
+                # pdb.set_trace()
             elif self.iteration_node_rendering == self.opt.iterations_node_sampling:
                 # Downsampling nodes for sparse control
                 # Strategy 1: Directly use the original gs as nodes
                 # Strategy 2: Sampling in the hyper space across times
                 strategy = self.opt.deform_downsamp_strategy
+                # import pdb
+                # pdb.set_trace()
                 if strategy == 'direct':
                     original_gaussians: GaussianModel = self.deform.deform.as_gaussians
                     self.deform.deform.init(opt=self.opt, init_pcl=original_gaussians.get_xyz, keep_all=True, force_init=True, reset_bbox=False, feature=self.gaussians.feature)
@@ -1897,6 +2773,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--deform-type", type=str, default='mlp')
+    parser.add_argument('--label_folder', type=str, default=None, help="Path to folder containing *_label.json files for segmentation mask labels.")
+
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
