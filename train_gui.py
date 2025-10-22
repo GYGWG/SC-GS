@@ -307,11 +307,108 @@ class GUI:
         color_idx = (label_id - 1) % len(color_palette)
         return torch.tensor(color_palette[color_idx], device="cuda")
 
+    def generate_label_colors_for_visualization(self):
+        """
+        Generate RGB colors for visualization based on LabeledObject membership.
+        This does NOT modify the actual Gaussian colors - returns a separate color tensor for rendering.
+        Returns a (N, 3) tensor of RGB colors where N is the number of Gaussians.
+        """
+        # Check if we have labeled object manager and if it needs to be recreated
+        need_recreate = False
+        if not hasattr(self.gaussians, 'labeled_object_manager') or self.gaussians.labeled_object_manager is None:
+            need_recreate = True
+        else:
+            # Check if the gaussian count has changed (densification/pruning)
+            labeled_objects = self.gaussians.labeled_object_manager
+            current_num_gaussians = self.gaussians.get_xyz.shape[0]
+            current_num_controls = self.deform.deform.as_gaussians.get_xyz.shape[0] if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians') else 0
+            
+            # Check if any stored indices are out of bounds
+            for obj_key in labeled_objects.objects.keys():
+                labeled_obj = labeled_objects.get_object(int(obj_key))
+                if len(labeled_obj.gaussian_indices) > 0:
+                    if labeled_obj.gaussian_indices.max() >= current_num_gaussians:
+                        need_recreate = True
+                        break
+                if len(labeled_obj.control_indices) > 0 and current_num_controls > 0:
+                    if labeled_obj.control_indices.max() >= current_num_controls:
+                        need_recreate = True
+                        break
+        
+        if need_recreate:
+            print("[Info] Creating/Recreating LabeledObjectManager for visualization...")
+            if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
+                control_gaussians = self.deform.deform.as_gaussians
+                self.gaussians.labeled_object_manager = self.gaussians.create_labeled_object_manager(control_gaussians)
+            else:
+                print("[Warning] Cannot create LabeledObjectManager without control points.")
+                return None
+        
+        labeled_objects = self.gaussians.labeled_object_manager
+        
+        if len(labeled_objects.objects) == 0:
+            print("[Warning] No labeled objects found.")
+            return None
+        
+        # Determine which gaussians to color based on visualization mode
+        if 'Node' in self.visualization_mode:
+            # Coloring control nodes
+            if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
+                num_points = self.deform.deform.as_gaussians.get_xyz.shape[0]
+                label_colors = torch.ones((num_points, 3), device="cuda")  # Default white
+                
+                object_ids = sorted([int(k) for k in labeled_objects.objects.keys()])
+                for obj_id in object_ids:
+                    labeled_obj = labeled_objects.get_object(obj_id)
+                    color = self.get_label_color(obj_id)
+                    
+                    if len(labeled_obj.control_indices) > 0:
+                        valid_mask = labeled_obj.control_indices < num_points
+                        valid_indices = labeled_obj.control_indices[valid_mask]
+                        if len(valid_indices) > 0:
+                            label_colors[valid_indices] = color
+                
+                # Color background (label 0) as white
+                if hasattr(self.deform.deform.as_gaussians, '_label') and self.deform.deform.as_gaussians._label is not None:
+                    background_mask = (self.deform.deform.as_gaussians._label == 0)
+                    if background_mask.any():
+                        label_colors[background_mask] = torch.tensor([1.0, 1.0, 1.0], device="cuda")
+                
+                return label_colors
+            else:
+                return None
+        else:
+            # Coloring main Gaussians
+            num_points = self.gaussians.get_xyz.shape[0]
+            label_colors = torch.ones((num_points, 3), device="cuda")  # Default white
+            
+            object_ids = sorted([int(k) for k in labeled_objects.objects.keys()])
+            for obj_id in object_ids:
+                labeled_obj = labeled_objects.get_object(obj_id)
+                color = self.get_label_color(obj_id)
+                
+                if len(labeled_obj.gaussian_indices) > 0:
+                    valid_mask = labeled_obj.gaussian_indices < num_points
+                    valid_indices = labeled_obj.gaussian_indices[valid_mask]
+                    if len(valid_indices) > 0:
+                        label_colors[valid_indices] = color
+            
+            # Color background (label 0) as white
+            if hasattr(self.gaussians, '_label') and self.gaussians._label is not None:
+                background_mask = (self.gaussians._label == 0)
+                if background_mask.any():
+                    label_colors[background_mask] = torch.tensor([1.0, 1.0, 1.0], device="cuda")
+            
+            return label_colors
+    
     def color_by_labeled_objects(self):
         """
         Color gaussians and control points based on their LabeledObject membership using distinct colors.
         This works with the LabeledObjectManager to color all gaussians and control points
         that belong to the same LabeledObject with the same distinct color.
+        
+        NOTE: This method modifies the actual Gaussian colors. Use generate_label_colors_for_visualization()
+        for non-destructive visualization.
         """
         # Check if we have labeled object manager and if it needs to be recreated
         need_recreate = False
@@ -1473,10 +1570,22 @@ class GUI:
                 if self.iteration > self.opt.node_densify_from_iter and self.iteration % self.opt.node_densification_interval == 0 and self.iteration < self.opt.node_densify_until_iter and self.iteration > self.opt.warm_up or self.iteration == self.opt.node_force_densify_prune_step:
                     # Nodes densify
                     self.deform.densify(max_grad=self.opt.densify_grad_threshold, x=self.gaussians.get_xyz, x_grad=self.gaussians.xyz_gradient_accum / self.gaussians.denom, feature=self.gaussians.feature, force_dp=(self.iteration == self.opt.node_force_densify_prune_step))
+                    
+                    # Recreate LabeledObjectManager after node densification to update indices
+                    if hasattr(self.gaussians, 'labeled_object_manager') and self.gaussians.labeled_object_manager is not None and self.iteration > self.opt.warm_up:
+                        print(f"[ITER {self.iteration}] Recreating LabeledObjectManager after node densification")
+                        control_gaussians = self.deform.deform.as_gaussians
+                        self.gaussians.labeled_object_manager = self.gaussians.create_labeled_object_manager(control_gaussians)
 
                 if self.iteration > self.opt.densify_from_iter and self.iteration % self.opt.densification_interval == 0:
                     size_threshold = 20 if self.iteration > self.opt.opacity_reset_interval else None
                     self.gaussians.densify_and_prune(self.opt.densify_grad_threshold, 0.005, self.scene.cameras_extent, size_threshold)
+                    
+                    # Recreate LabeledObjectManager after Gaussian densification to update indices
+                    if hasattr(self.gaussians, 'labeled_object_manager') and self.gaussians.labeled_object_manager is not None and self.iteration > self.opt.warm_up:
+                        print(f"[ITER {self.iteration}] Recreating LabeledObjectManager after Gaussian densification")
+                        control_gaussians = self.deform.deform.as_gaussians
+                        self.gaussians.labeled_object_manager = self.gaussians.create_labeled_object_manager(control_gaussians)
 
                 if self.iteration % self.opt.opacity_reset_interval == 0 or (
                         self.dataset.white_background and self.iteration == self.opt.densify_from_iter):
@@ -1822,96 +1931,13 @@ class GUI:
             else:
                 d_opacity[self.gaussians.motion_mask > .1] = - 1e3
         
-        # Apply label coloring if in Labels visualization mode
+        # Prepare label colors for visualization if in Labels mode
         if self.visualization_mode == 'Labels':
-            # Store original colors only if we haven't stored them yet or if sizes changed
-            if not hasattr(self, '_original_features_dc_main') or \
-               self._original_features_dc_main.shape[0] != self.gaussians._features_dc.shape[0]:
-                # Only store if we're not already in labels mode (to avoid storing label colors as originals)
-                if not hasattr(self, '_labels_mode_active'):
-                    self._original_features_dc_main = self.gaussians._features_dc.clone()
-                    print("[Info] Stored original Gaussian colors for Labels mode")
-            
-            if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
-                if not hasattr(self, '_original_features_dc_nodes') or \
-                   self._original_features_dc_nodes.shape[0] != self.deform.deform.as_gaussians._features_dc.shape[0]:
-                    # Only store if we're not already in labels mode
-                    if not hasattr(self, '_labels_mode_active'):
-                        self._original_features_dc_nodes = self.deform.deform.as_gaussians._features_dc.clone()
-                        print("[Info] Stored original control point colors for Labels mode")
-            
-            # Mark that we're in labels mode
-            self._labels_mode_active = True
-            
-            # Disable gradients for _features_dc to prevent optimizer from overriding our label colors
-            if not hasattr(self, '_features_dc_requires_grad_original'):
-                self._features_dc_requires_grad_original = self.gaussians._features_dc.requires_grad
-            self.gaussians._features_dc.requires_grad_(False)
-            
-            if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
-                if not hasattr(self, '_control_features_dc_requires_grad_original'):
-                    self._control_features_dc_requires_grad_original = self.deform.deform.as_gaussians._features_dc.requires_grad
-                self.deform.deform.as_gaussians._features_dc.requires_grad_(False)
-            
-            # Color all gaussians and control points by their LabeledObject membership
-            # Apply colors more aggressively to prevent blending during evaluation
-            self.color_by_labeled_objects()
-            
-            # Re-apply colors after any potential operations that might affect them
-            # This ensures colors stay consistent even during evaluation iterations
-            if hasattr(self, '_last_color_apply_iter'):
-                if self.iteration != self._last_color_apply_iter:
-                    # Re-apply colors if we're in a new iteration (evaluation might have happened)
-                    self.color_by_labeled_objects()
-                    self._last_color_apply_iter = self.iteration
-            else:
-                self._last_color_apply_iter = self.iteration
-            
-            # Debug: Check if colors are actually being applied
-            if hasattr(self, '_debug_counter'):
-                self._debug_counter += 1
-            else:
-                self._debug_counter = 1
-            
-            if self._debug_counter % 50 == 0:  # Print every 50 frames to reduce spam
-                print(f"[Debug] Labels mode active - Frame {self._debug_counter}, Iteration {self.iteration}")
-                # Check a few sample colors to see if they're actually label colors
-                sample_colors = self.gaussians._features_dc[:3, 0, :].detach().cpu().numpy()
-                print(f"[Debug] Sample Gaussian colors: {sample_colors}")
+            # Generate label colors without modifying the actual Gaussian colors
+            # This returns a (N, 3) tensor of RGB colors for rendering
+            label_colors = self.generate_label_colors_for_visualization()
         else:
-            # Restore original colors if they were stored and we were in labels mode
-            if hasattr(self, '_labels_mode_active'):
-                if hasattr(self, '_original_features_dc_main'):
-                    # Check if sizes match (in case gaussians were densified/pruned)
-                    if self._original_features_dc_main.shape[0] == self.gaussians._features_dc.shape[0]:
-                        self.gaussians._features_dc.copy_(self._original_features_dc_main)
-                        print("[Info] Restored original Gaussian colors")
-                    delattr(self, '_original_features_dc_main')
-                if hasattr(self, '_original_features_dc_nodes') and self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
-                    # Check if sizes match (in case nodes were densified/pruned)
-                    if self._original_features_dc_nodes.shape[0] == self.deform.deform.as_gaussians._features_dc.shape[0]:
-                        self.deform.deform.as_gaussians._features_dc.copy_(self._original_features_dc_nodes)
-                        print("[Info] Restored original control point colors")
-                    delattr(self, '_original_features_dc_nodes')
-                
-                # Restore gradients for _features_dc
-                if hasattr(self, '_features_dc_requires_grad_original'):
-                    self.gaussians._features_dc.requires_grad_(self._features_dc_requires_grad_original)
-                    delattr(self, '_features_dc_requires_grad_original')
-                
-                if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
-                    if hasattr(self, '_control_features_dc_requires_grad_original'):
-                        self.deform.deform.as_gaussians._features_dc.requires_grad_(self._control_features_dc_requires_grad_original)
-                        delattr(self, '_control_features_dc_requires_grad_original')
-                
-                # Clear the labels mode flag
-                delattr(self, '_labels_mode_active')
-                # Clear debug counter
-                if hasattr(self, '_debug_counter'):
-                    delattr(self, '_debug_counter')
-                # Clear color apply iteration tracking
-                if hasattr(self, '_last_color_apply_iter'):
-                    delattr(self, '_last_color_apply_iter')
+            label_colors = None
             
         
         render_motion = "Motion" in self.visualization_mode
@@ -1921,14 +1947,10 @@ class GUI:
             d_xyz, d_rotation, d_scaling = 0, 0, 0
             print('Async in Gaussian Switching')
         
-        # Disable d_color when in Labels mode to prevent it from overriding our label colors
-        render_d_color = None if self.visualization_mode == 'Labels' else d_color
+        # Use override_color for Labels mode, otherwise use normal rendering
+        override_color = label_colors if self.visualization_mode == 'Labels' else None
         
-        # Final color application right before rendering to ensure colors are fresh
-        if self.visualization_mode == 'Labels':
-            self.color_by_labeled_objects()
-        
-        out = render(viewpoint_camera=cur_cam, pc=gaussians, pipe=self.pipe, bg_color=self.background, d_xyz=d_xyz, d_rotation=d_rotation, d_scaling=d_scaling, render_motion=render_motion, d_opacity=d_opacity, d_color=render_d_color, d_rot_as_res=self.deform.d_rot_as_res, scale_const=vis_scale_const, d_rotation_bias=d_rotation_bias)
+        out = render(viewpoint_camera=cur_cam, pc=gaussians, pipe=self.pipe, bg_color=self.background, d_xyz=d_xyz, d_rotation=d_rotation, d_scaling=d_scaling, render_motion=render_motion, d_opacity=d_opacity, d_color=d_color, d_rot_as_res=self.deform.d_rot_as_res, scale_const=vis_scale_const, d_rotation_bias=d_rotation_bias, override_color=override_color)
 
         if self.mode == "normal_dep":
             from utils.other_utils import depth2normal
