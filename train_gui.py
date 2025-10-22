@@ -358,6 +358,7 @@ class GUI:
             # Color each LabeledObject with a distinct color
             object_ids = sorted([int(k) for k in labeled_objects.objects.keys()])
             
+            # First, color all labeled objects
             for obj_id in object_ids:
                 labeled_obj = labeled_objects.get_object(obj_id)
                 color = self.get_label_color(obj_id)
@@ -384,7 +385,27 @@ class GUI:
                         control_gaussians._features_dc[valid_indices] = sh_color.view(1, 1, 3).expand_as(
                             control_gaussians._features_dc[valid_indices])
             
-            print(f"[Info] Successfully colored {len(object_ids)} labeled objects with distinct colors")
+            # Now color background (label 0) as white
+            if hasattr(self.gaussians, '_label') and self.gaussians._label is not None:
+                background_mask = (self.gaussians._label == 0)
+                if background_mask.any():
+                    white_color = torch.tensor([1.0, 1.0, 1.0], device="cuda")
+                    white_sh_color = (white_color - 0.5) / 0.28209479177387814
+                    self.gaussians._features_dc[background_mask] = white_sh_color.view(1, 1, 3).expand_as(
+                        self.gaussians._features_dc[background_mask])
+            
+            # Also color background control points if they exist
+            if self.deform.name == 'node' and hasattr(self.deform.deform, 'as_gaussians'):
+                control_gaussians = self.deform.deform.as_gaussians
+                if hasattr(control_gaussians, '_label') and control_gaussians._label is not None:
+                    control_background_mask = (control_gaussians._label == 0)
+                    if control_background_mask.any():
+                        white_color = torch.tensor([1.0, 1.0, 1.0], device="cuda")
+                        white_sh_color = (white_color - 0.5) / 0.28209479177387814
+                        control_gaussians._features_dc[control_background_mask] = white_sh_color.view(1, 1, 3).expand_as(
+                            control_gaussians._features_dc[control_background_mask])
+            
+            print(f"[Info] Successfully colored {len(object_ids)} labeled objects + background with distinct colors")
 
     def animation_initialize(self, use_traj=True):
         from lap_deform import LapDeform
@@ -1833,7 +1854,18 @@ class GUI:
                 self.deform.deform.as_gaussians._features_dc.requires_grad_(False)
             
             # Color all gaussians and control points by their LabeledObject membership
+            # Apply colors more aggressively to prevent blending during evaluation
             self.color_by_labeled_objects()
+            
+            # Re-apply colors after any potential operations that might affect them
+            # This ensures colors stay consistent even during evaluation iterations
+            if hasattr(self, '_last_color_apply_iter'):
+                if self.iteration != self._last_color_apply_iter:
+                    # Re-apply colors if we're in a new iteration (evaluation might have happened)
+                    self.color_by_labeled_objects()
+                    self._last_color_apply_iter = self.iteration
+            else:
+                self._last_color_apply_iter = self.iteration
             
             # Debug: Check if colors are actually being applied
             if hasattr(self, '_debug_counter'):
@@ -1841,8 +1873,8 @@ class GUI:
             else:
                 self._debug_counter = 1
             
-            if self._debug_counter % 10 == 0:  # Print every 10 frames
-                print(f"[Debug] Labels mode active - Frame {self._debug_counter}")
+            if self._debug_counter % 50 == 0:  # Print every 50 frames to reduce spam
+                print(f"[Debug] Labels mode active - Frame {self._debug_counter}, Iteration {self.iteration}")
                 # Check a few sample colors to see if they're actually label colors
                 sample_colors = self.gaussians._features_dc[:3, 0, :].detach().cpu().numpy()
                 print(f"[Debug] Sample Gaussian colors: {sample_colors}")
@@ -1877,6 +1909,9 @@ class GUI:
                 # Clear debug counter
                 if hasattr(self, '_debug_counter'):
                     delattr(self, '_debug_counter')
+                # Clear color apply iteration tracking
+                if hasattr(self, '_last_color_apply_iter'):
+                    delattr(self, '_last_color_apply_iter')
             
         
         render_motion = "Motion" in self.visualization_mode
@@ -1888,6 +1923,10 @@ class GUI:
         
         # Disable d_color when in Labels mode to prevent it from overriding our label colors
         render_d_color = None if self.visualization_mode == 'Labels' else d_color
+        
+        # Final color application right before rendering to ensure colors are fresh
+        if self.visualization_mode == 'Labels':
+            self.color_by_labeled_objects()
         
         out = render(viewpoint_camera=cur_cam, pc=gaussians, pipe=self.pipe, bg_color=self.background, d_xyz=d_xyz, d_rotation=d_rotation, d_scaling=d_scaling, render_motion=render_motion, d_opacity=d_opacity, d_color=render_d_color, d_rot_as_res=self.deform.d_rot_as_res, scale_const=vis_scale_const, d_rotation_bias=d_rotation_bias)
 
