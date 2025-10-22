@@ -988,11 +988,6 @@ class LabeledObject(nn.Module):
         gaussian_centers = gaussians._xyz[gaussian_indices].mean(dim=0)
         self.center = (control_centers + gaussian_centers) / 2
         
-        # Initialize transformation parameters (shared by all control points and Gaussians)
-        device = control_gaussians._xyz.device
-        self.translation = nn.Parameter(torch.zeros(3, device=device))
-        self.rotation = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0], device=device))  # quaternion (w, x, y, z)
-        
         print(f"Created LabeledObject {label}: {len(control_indices)} control points, {len(gaussian_indices)} Gaussians")
     
     def get_control_xyz(self) -> torch.Tensor:
@@ -1011,146 +1006,14 @@ class LabeledObject(nn.Module):
         """Set positions of Gaussians for this object."""
         self.gaussians._xyz.data[self.gaussian_indices] = xyz
     
-    def apply_transformation(self):
-        """Apply the current transformation to all control points and Gaussians."""
-        # Normalize quaternion
-        rotation_quat = self.rotation / torch.norm(self.rotation)
-        
-        # Convert quaternion to rotation matrix
-        rotation_matrix = self._quaternion_to_rotation_matrix(rotation_quat)
-        
-        # Apply transformation to control points
-        control_points = self.get_control_xyz()
-        centered_control = control_points - self.center
-        rotated_control = torch.matmul(centered_control, rotation_matrix.T)
-        transformed_control = rotated_control + self.center + self.translation
-        self.set_control_xyz(transformed_control)
-        
-        # Apply transformation to Gaussians
-        gaussian_points = self.get_gaussian_xyz()
-        centered_gaussian = gaussian_points - self.center
-        rotated_gaussian = torch.matmul(centered_gaussian, rotation_matrix.T)
-        transformed_gaussian = rotated_gaussian + self.center + self.translation
-        self.set_gaussian_xyz(transformed_gaussian)
-    
-    def _quaternion_to_rotation_matrix(self, q: torch.Tensor) -> torch.Tensor:
-        """Convert quaternion to rotation matrix."""
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        
-        # Normalize quaternion
-        norm = torch.sqrt(w*w + x*x + y*y + z*z)
-        w, x, y, z = w/norm, x/norm, y/norm, z/norm
-        
-        # Convert to rotation matrix
-        R = torch.stack([
-            torch.stack([1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)]),
-            torch.stack([2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)]),
-            torch.stack([2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)])
-        ])
-        
-        return R
-    
-    def reset_transformation(self):
-        """Reset transformation to identity."""
-        self.translation.data.zero_()
-        self.rotation.data = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.translation.device)
-        self.apply_transformation()
-    
     def get_info(self) -> dict:
         """Get information about this object."""
         return {
             'label': self.label,
             'num_control_points': len(self.control_indices),
             'num_gaussians': len(self.gaussian_indices),
-            'center': self.center.detach().cpu().numpy(),
-            'translation': self.translation.detach().cpu().numpy(),
-            'rotation_quat': self.rotation.detach().cpu().numpy()
+            'center': self.center.detach().cpu().numpy()
         }
-    
-    def learn_transformation_to_target(self, target_obj: 'LabeledObject', num_iterations: int = 100, lr: float = 0.01):
-        """
-        Learn a 6DOF transformation to move this LabeledObject to the target LabeledObject's position.
-        This operates at the LabeledObject level - the learned transformation parameters are shared
-        by all Gaussians and control points within this object.
-        
-        Args:
-            target_obj: Target LabeledObject to move towards
-            num_iterations: Number of optimization iterations
-            lr: Learning rate
-            
-        Returns:
-            loss_history: List of losses during optimization
-        """
-        import torch.optim as optim
-        
-        # Create optimizer for the shared transformation parameters
-        optimizer = optim.Adam([self.translation, self.rotation], lr=lr)
-        
-        # Get target positions
-        target_control_xyz = target_obj.get_control_xyz().detach()
-        target_gaussian_xyz = target_obj.get_gaussian_xyz().detach()
-        
-        # Store original positions (before any transformation)
-        original_control_xyz = self.get_control_xyz().clone().detach()
-        original_gaussian_xyz = self.get_gaussian_xyz().clone().detach()
-        original_center = self.center.clone().detach()
-        
-        loss_history = []
-        
-        print(f"Learning 6DOF transformation from object {self.label} to object {target_obj.label}...")
-        
-        for i in range(num_iterations):
-            optimizer.zero_grad()
-            
-            # Apply current transformation parameters (without modifying underlying data)
-            # Normalize quaternion
-            rotation_quat = self.rotation / torch.norm(self.rotation)
-            rotation_matrix = self._quaternion_to_rotation_matrix(rotation_quat)
-            
-            # Transform control points (from original positions)
-            centered_control = original_control_xyz - original_center
-            rotated_control = torch.matmul(centered_control, rotation_matrix.T)
-            transformed_control = rotated_control + original_center + self.translation
-            
-            # Transform Gaussians (from original positions)
-            centered_gaussian = original_gaussian_xyz - original_center
-            rotated_gaussian = torch.matmul(centered_gaussian, rotation_matrix.T)
-            transformed_gaussian = rotated_gaussian + original_center + self.translation
-            
-            # Compute loss (MSE between transformed and target positions)
-            loss = torch.mean((transformed_control - target_control_xyz) ** 2) + \
-                   torch.mean((transformed_gaussian - target_gaussian_xyz) ** 2)
-            
-            loss.backward()
-            optimizer.step()
-            
-            loss_history.append(loss.item())
-            
-            if (i + 1) % 10 == 0:
-                print(f"  Iteration {i+1}/{num_iterations}, Loss: {loss.item():.6f}")
-        
-        # Apply the final learned transformation
-        self.set_control_xyz(original_control_xyz)
-        self.set_gaussian_xyz(original_gaussian_xyz)
-        self.apply_transformation()
-        
-        print(f"✅ Learned transformation: translation={self.translation.detach().cpu().numpy()}, "
-              f"rotation={self.rotation.detach().cpu().numpy()}")
-        
-        return loss_history
-    
-    def copy_transformation_from(self, source_obj: 'LabeledObject'):
-        """
-        Copy the transformation parameters from another LabeledObject.
-        This is useful for transferring learned transformations.
-        
-        Args:
-            source_obj: Source LabeledObject to copy transformation from
-        """
-        self.translation.data = source_obj.translation.data.clone()
-        self.rotation.data = source_obj.rotation.data.clone()
-        self.center = source_obj.center.clone()
-        print(f"Copied transformation from object {source_obj.label} to object {self.label}")
 
 
 class LabeledObjectManager(nn.Module):
